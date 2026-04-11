@@ -6,7 +6,8 @@ using ChurchBot;
 var host = Host.CreateDefaultBuilder(args)
     .ConfigureAppConfiguration(config =>
     {
-        config.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
+        config.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true);
+        config.AddEnvironmentVariables(); // Railway / Docker env vars
     })
     .ConfigureServices((context, services) =>
     {
