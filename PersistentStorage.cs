@@ -73,15 +73,12 @@ public class PersistentStorage
             CleanupOldProcessedIfNeeded();
             using var conn = OpenConnection();
             using var cmd = conn.CreateCommand();
-            cmd.CommandText = """
-                INSERT OR IGNORE INTO ProcessedMessages (MessageId, ProcessedAt)
-                VALUES ($id, $now);
-                SELECT changes();
-            """;
+            // Один запрос + ExecuteNonQuery возвращает кол-во затронутых строк:
+            // 1 = новый messageId, 0 = уже обрабатывался (IGNORE)
+            cmd.CommandText = "INSERT OR IGNORE INTO ProcessedMessages (MessageId, ProcessedAt) VALUES ($id, $now)";
             cmd.Parameters.AddWithValue("$id", messageId);
             cmd.Parameters.AddWithValue("$now", DateTime.UtcNow.ToString("O"));
-            var changes = (long)(cmd.ExecuteScalar() ?? 0L);
-            return changes > 0;
+            return cmd.ExecuteNonQuery() > 0;
         }
     }
 

@@ -40,19 +40,26 @@ public class BotHandler
     {
         if (update.Message is not { } message) return;
 
-        // Защита от дублей
-        if (!_persistentStorage.TryMarkProcessed(message.MessageId)) return;
-
-        var chatId = message.Chat.Id;
-        bool isGroup = chatId == _groupChatId;
-
-        if (isGroup)
+        try
         {
-            await HandleGroupMessageAsync(message, ct);
-            return;
-        }
+            // Защита от дублей
+            if (!_persistentStorage.TryMarkProcessed(message.MessageId)) return;
 
-        await HandlePrivateMessageAsync(message, chatId, ct);
+            var chatId = message.Chat.Id;
+            bool isGroup = chatId == _groupChatId;
+
+            if (isGroup)
+            {
+                await HandleGroupMessageAsync(message, ct);
+                return;
+            }
+
+            await HandlePrivateMessageAsync(message, chatId, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unhandled error processing message {MessageId}", message.MessageId);
+        }
     }
 
     // ── Групповой чат ────────────────────────────────────────────────────────
