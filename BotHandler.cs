@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
@@ -9,20 +11,23 @@ public class BotHandler
 {
     private ITelegramBotClient _bot = null!;
     private long _groupChatId;
-    private readonly UserStateStorage _storage;
+    private readonly UserStateStorage _stateStorage;
+    private readonly PersistentStorage _persistentStorage;
+    private readonly BotConfig _config;
+    private readonly ILogger<BotHandler> _logger;
 
-    private static readonly string[] Categories =
-    [
-        "🍕 Пицца с пастором",
-        "❓ Вопрос пастору",
-        "🙋 Вопрос молодёжному лидеру",
-        "💡 Идея для молодёжки",
-        "🙏 Молитвенная нужда"
-    ];
+    private const string CancelLabel = "❌ Отмена";
 
-    public BotHandler(UserStateStorage storage)
+    public BotHandler(
+        UserStateStorage stateStorage,
+        PersistentStorage persistentStorage,
+        IOptions<BotConfig> config,
+        ILogger<BotHandler> logger)
     {
-        _storage = storage;
+        _stateStorage = stateStorage;
+        _persistentStorage = persistentStorage;
+        _config = config.Value;
+        _logger = logger;
     }
 
     public void SetClient(ITelegramBotClient bot, long groupChatId)
@@ -31,39 +36,81 @@ public class BotHandler
         _groupChatId = groupChatId;
     }
 
-    public async Task HandleUpdateAsync(ITelegramBotClient bot, Update update, CancellationToken ct)
+    public async Task HandleUpdateAsync(ITelegramBotClient _, Update update, CancellationToken ct)
     {
         if (update.Message is not { } message) return;
-        if (message.Text is not { } text) return;
 
-        // Защита от дублей: пропускаем уже обработанные сообщения
-        if (!_storage.TryMarkProcessed(message.MessageId)) return;
+        // Защита от дублей
+        if (!_persistentStorage.TryMarkProcessed(message.MessageId)) return;
 
         var chatId = message.Chat.Id;
         bool isGroup = chatId == _groupChatId;
 
-        // Ответ из группового чата → переслать пользователю
-        if (isGroup && message.ReplyToMessage is { } reply)
+        if (isGroup)
         {
-            var userId = _storage.GetUserByMessage(reply.MessageId);
-            if (userId is not null)
-            {
-                await _bot.SendMessage(
-                    chatId: userId.Value,
-                    text: $"📩 *Ответ от команды:*\n\n{EscapeMarkdown(text)}",
-                    parseMode: Telegram.Bot.Types.Enums.ParseMode.MarkdownV2,
-                    cancellationToken: ct
-                );
-            }
+            await HandleGroupMessageAsync(message, ct);
             return;
         }
 
-        // Личный чат с пользователем
-        if (isGroup) return;
+        await HandlePrivateMessageAsync(message, chatId, ct);
+    }
 
+    // ── Групповой чат ────────────────────────────────────────────────────────
+
+    private async Task HandleGroupMessageAsync(Message message, CancellationToken ct)
+    {
+        var text = message.Text;
+
+        // /stats — статистика обращений
+        if (text is not null && text.StartsWith("/stats"))
+        {
+            await SendStatsAsync(message.Chat.Id, ct);
+            return;
+        }
+
+        // Ответ на сообщение бота → переслать автору обращения
+        if (message.ReplyToMessage is not { } reply) return;
+        if (text is null) return;
+
+        var userId = _persistentStorage.GetUserByMessage(reply.MessageId);
+        if (userId is null)
+        {
+            _logger.LogWarning("Reply to group message {MessageId}: no user mapping found", reply.MessageId);
+            return;
+        }
+
+        await _bot.SendMessage(
+            chatId: userId.Value,
+            text: $"📩 *Ответ от команды:*\n\n{EscapeMarkdown(text)}",
+            parseMode: Telegram.Bot.Types.Enums.ParseMode.MarkdownV2,
+            cancellationToken: ct
+        );
+        _logger.LogInformation("Forwarded reply to user {UserId}", userId.Value);
+    }
+
+    // ── Личный чат ───────────────────────────────────────────────────────────
+
+    private async Task HandlePrivateMessageAsync(Message message, long chatId, CancellationToken ct)
+    {
+        // Нетекстовые сообщения (фото, голосовые, стикеры и т.д.)
+        if (message.Text is not { } text)
+        {
+            var markup = _stateStorage.GetCategory(chatId) is not null
+                ? (IReplyMarkup)BuildCancelKeyboard()
+                : BuildCategoryKeyboard();
+            await _bot.SendMessage(
+                chatId: chatId,
+                text: "Пожалуйста, отправь текстовое сообщение 📝",
+                replyMarkup: markup,
+                cancellationToken: ct
+            );
+            return;
+        }
+
+        // /start — полный сброс состояния
         if (text == "/start")
         {
-            _storage.ClearCategory(chatId);
+            _stateStorage.ClearCategory(chatId);
             await _bot.SendMessage(
                 chatId: chatId,
                 text: "👋 Привет! Это анонимный бот нашей церкви.\n\nВыбери категорию обращения:",
@@ -73,38 +120,41 @@ public class BotHandler
             return;
         }
 
-        // Если текст совпадает с одной из категорий — сохраняем и просим ввести сообщение
-        if (Categories.Contains(text))
+        // Отмена ввода
+        if (text is "/cancel" or CancelLabel)
         {
-            // Пользователь уже выбрал категорию и ждёт ввода — не отправлять подсказку повторно
-            if (_storage.GetCategory(chatId) is not null) return;
-
-            // Сначала очищаем, потом устанавливаем (атомарный сброс состояния)
-            _storage.ClearCategory(chatId);
-            _storage.SetCategory(chatId, text);
-            var hint = text switch
-            {
-                "🍕 Пицца с пастором" => "Отлично! Напиши о чём хотел бы поговорить с пастором за чашкой чая или пиццей. Это может быть личный вопрос, духовная тема или просто желание пообщаться 😊",
-                "❓ Вопрос пастору" => "Напиши свой вопрос пастору. Это может быть вопрос о вере, Библии, жизненной ситуации или о чём-то что давно тебя беспокоит 🙏",
-                "🙋 Вопрос молодёжному лидеру" => "Напиши свой вопрос молодёжному лидеру. Это может быть про служение, мероприятия, отношения в команде или личное 💬",
-                "💡 Идея для молодёжки" => "Поделись своей идеей! Что можно улучшить, добавить или изменить на молодёжных встречах? Любая идея важна ✨",
-                "🙏 Молитвенная нужда" => "Напиши о чём тебе нужна молитва. Это останется анонимным — команда помолится за тебя ❤️",
-                _ => "Напиши своё сообщение — оно будет отправлено анонимно 👇"
-            };
+            _stateStorage.ClearCategory(chatId);
             await _bot.SendMessage(
                 chatId: chatId,
-                text: hint,
-                replyMarkup: new ReplyKeyboardRemove(),
+                text: "Отменено. Выбери категорию:",
+                replyMarkup: BuildCategoryKeyboard(),
                 cancellationToken: ct
             );
             return;
         }
 
-        // Если есть выбранная категория — отправляем сообщение в группу
-        var category = _storage.GetCategory(chatId);
+        // Выбор категории
+        var matchedCategory = _config.Categories.FirstOrDefault(c => c.Label == text);
+        if (matchedCategory is not null)
+        {
+            // Уже ждём ввода — игнорируем повторное нажатие
+            if (_stateStorage.GetCategory(chatId) is not null) return;
+
+            _stateStorage.SetCategory(chatId, matchedCategory.Label);
+            await _bot.SendMessage(
+                chatId: chatId,
+                text: matchedCategory.Hint,
+                replyMarkup: BuildCancelKeyboard(),
+                cancellationToken: ct
+            );
+            return;
+        }
+
+        // Отправка анонимного сообщения в группу
+        var category = _stateStorage.GetCategory(chatId);
         if (category is not null)
         {
-            _storage.ClearCategory(chatId);
+            _stateStorage.ClearCategory(chatId);
 
             var forwarded = await _bot.SendMessage(
                 chatId: _groupChatId,
@@ -113,7 +163,9 @@ public class BotHandler
                 cancellationToken: ct
             );
 
-            _storage.MapMessage(forwarded.MessageId, chatId);
+            _persistentStorage.MapMessage(forwarded.MessageId, chatId, category);
+            _persistentStorage.IncrementStat(category);
+            _logger.LogInformation("Message from {ChatId} in category '{Category}' forwarded to group", chatId, category);
 
             await _bot.SendMessage(
                 chatId: chatId,
@@ -124,7 +176,7 @@ public class BotHandler
             return;
         }
 
-        // Нет выбранной категории — напоминаем
+        // Категория не выбрана — напоминаем
         await _bot.SendMessage(
             chatId: chatId,
             text: "Сначала выбери категорию 👇",
@@ -133,37 +185,59 @@ public class BotHandler
         );
     }
 
-    public Task HandlePollingErrorAsync(ITelegramBotClient bot, Exception exception, CancellationToken ct)
+    // ── Статистика ───────────────────────────────────────────────────────────
+
+    private async Task SendStatsAsync(long targetChatId, CancellationToken ct)
     {
-        var errorMessage = exception switch
+        var stats = _persistentStorage.GetStats();
+        if (stats.Count == 0)
+        {
+            await _bot.SendMessage(chatId: targetChatId, text: "📊 Статистика пока пуста.", cancellationToken: ct);
+            return;
+        }
+
+        var total = stats.Values.Sum();
+        var lines = stats.Select(kv => $"{EscapeMarkdown(kv.Key)}: *{kv.Value}*");
+        var statsText = $"📊 *Статистика обращений:*\n\n{string.Join("\n", lines)}\n\n_Всего: {total}_";
+
+        await _bot.SendMessage(
+            chatId: targetChatId,
+            text: statsText,
+            parseMode: Telegram.Bot.Types.Enums.ParseMode.MarkdownV2,
+            cancellationToken: ct
+        );
+    }
+
+    // ── Обработка ошибок ─────────────────────────────────────────────────────
+
+    public Task HandlePollingErrorAsync(ITelegramBotClient _, Exception exception, CancellationToken ct)
+    {
+        var msg = exception switch
         {
             ApiRequestException apiEx => $"Telegram API Error [{apiEx.ErrorCode}]: {apiEx.Message}",
             _ => exception.ToString()
         };
-        Console.Error.WriteLine(errorMessage);
+        _logger.LogError("Polling error: {Error}", msg);
         return Task.CompletedTask;
     }
 
-    private static ReplyKeyboardMarkup BuildCategoryKeyboard()
+    // ── Клавиатуры ───────────────────────────────────────────────────────────
+
+    private ReplyKeyboardMarkup BuildCategoryKeyboard()
     {
-        return new ReplyKeyboardMarkup(new[]
-        {
-            new KeyboardButton[] { Categories[0] },
-            new KeyboardButton[] { Categories[1] },
-            new KeyboardButton[] { Categories[2] },
-            new KeyboardButton[] { Categories[3] },
-            new KeyboardButton[] { Categories[4] },
-        })
-        {
-            ResizeKeyboard = true,
-            OneTimeKeyboard = true
-        };
+        var rows = _config.Categories
+            .Select(c => new KeyboardButton[] { c.Label })
+            .ToArray();
+        return new ReplyKeyboardMarkup(rows) { ResizeKeyboard = true, OneTimeKeyboard = true };
     }
 
-    private static string EscapeMarkdown(string text)
-    {
-        // Экранируем специальные символы MarkdownV2
-        return text
+    private static ReplyKeyboardMarkup BuildCancelKeyboard() =>
+        new(new[] { new KeyboardButton[] { CancelLabel } }) { ResizeKeyboard = true };
+
+    // ── Экранирование MarkdownV2 ─────────────────────────────────────────────
+
+    private static string EscapeMarkdown(string text) =>
+        text
             .Replace("\\", "\\\\")
             .Replace("_", "\\_")
             .Replace("*", "\\*")
@@ -183,5 +257,4 @@ public class BotHandler
             .Replace("}", "\\}")
             .Replace(".", "\\.")
             .Replace("!", "\\!");
-    }
 }
